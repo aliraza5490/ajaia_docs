@@ -4,24 +4,58 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "collab": "node server/ws-collab.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@tiptap/extension-collaboration": "^3.30.2",
+    "@tiptap/extension-collaboration-cursor": "3.0.0-next.6",
+    "@tiptap/extension-highlight": "^3.30.2",
+    "@tiptap/extension-image": "^3.30.2",
+    "@tiptap/extension-link": "^3.30.2",
+    "@tiptap/extension-placeholder": "^3.30.2",
+    "@tiptap/extension-task-item": "^3.30.2",
+    "@tiptap/extension-task-list": "^3.30.2",
+    "@tiptap/extension-text-align": "^3.30.2",
+    "@tiptap/extension-underline": "^3.30.2",
+    "@tiptap/pm": "^3.30.2",
+    "@tiptap/react": "^3.30.2",
+    "@tiptap/starter-kit": "^3.30.2",
+    "@tiptap/y-tiptap": "^3.0.9",
+    "better-sqlite3": "^13.0.3",
+    "lib0": "^0.2.117",
+    "lucide-react": "^1.32.0",
+    "mammoth": "^1.12.1",
+    "marked": "^18.0.10",
     "next": "16.3.1",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "uuid": "^14.0.2",
+    "ws": "^8.21.3",
+    "y-indexeddb": "^9.0.12",
+    "y-prosemirror": "^1.3.7",
+    "y-protocols": "^1.0.7",
+    "y-websocket": "^3.1.0",
+    "yjs": "^13.6.32"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/marked": "^6.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/uuid": "^11.0.0",
+    "@types/ws": "^8.18.1",
     "eslint": "^9",
     "eslint-config-next": "16.3.1",
+    "jsdom": "^30.0.1",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.11"
   },
   "packageManager": "pnpm@11.15.1"
 }
