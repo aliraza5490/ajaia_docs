@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Underline from '@tiptap/extension-underline';
@@ -15,6 +15,7 @@ import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCursor from '@tiptap/extension-collaboration-cursor';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
+import { IndexeddbPersistence } from 'y-indexeddb';
 
 import { DocumentItem, User } from '@/lib/types';
 import { EditorToolbar } from './EditorToolbar';
@@ -47,7 +48,11 @@ import {
   Clock,
   Wifi,
   WifiOff,
-  Users
+  Users,
+  HardDrive,
+  CheckCircle2,
+  AlertCircle,
+  X
 } from 'lucide-react';
 import LinkNext from 'next/link';
 import { useRouter } from 'next/navigation';
@@ -68,6 +73,12 @@ interface OnlineUser {
   role?: string;
 }
 
+interface ToastNotification {
+  id: string;
+  message: string;
+  type: 'info' | 'warning' | 'success' | 'error';
+}
+
 export const DocumentEditor: React.FC<DocumentEditorProps> = ({
   initialDocument,
   currentUser
@@ -75,10 +86,13 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
   const router = useRouter();
   const [doc, setDoc] = useState<DocumentItem>(initialDocument);
   const [title, setTitle] = useState(initialDocument.title);
-  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved'>('saved');
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved' | 'offline' | 'syncing'>('saved');
   const [lastSavedAt, setLastSavedAt] = useState<Date>(new Date(initialDocument.updated_at));
   const [isWsConnected, setIsWsConnected] = useState(false);
+  const [isOnline, setIsOnline] = useState<boolean>(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
+  const [isIdbSynced, setIsIdbSynced] = useState(false);
   const [onlineCollaborators, setOnlineCollaborators] = useState<OnlineUser[]>([]);
+  const [toast, setToast] = useState<ToastNotification | null>(null);
 
   // Modals & Panels state
   const [isShareOpen, setIsShareOpen] = useState(false);
@@ -87,15 +101,110 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
 
-  // Auto-save debounce timer ref
+  // Auto-save debounce timer ref and offline edits counter
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const offlineEditsCountRef = useRef<number>(0);
+  const toastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const canEdit = doc.can_edit ?? true;
 
   const [ydoc] = useState<Y.Doc>(() => new Y.Doc());
   const [provider, setProvider] = useState<WebsocketProvider | null>(null);
 
-  // Initialize Yjs WebSocket Provider with proper lifecycle cleanup
+  const showToast = useCallback((message: string, type: 'info' | 'warning' | 'success' | 'error' = 'info') => {
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+    }
+    const id = Math.random().toString(36).slice(2, 9);
+    setToast({ id, message, type });
+    toastTimeoutRef.current = setTimeout(() => {
+      setToast(null);
+    }, 4500);
+  }, []);
+
+  // Flush offline pending queue back to SQLite database
+  const flushPendingOfflineChanges = useCallback(async () => {
+    if (typeof window === 'undefined') return;
+    const queuedKey = `ajaia_offline_queue_${initialDocument.id}`;
+    const queuedStr = localStorage.getItem(queuedKey);
+    if (!queuedStr) return;
+
+    try {
+      const queued = JSON.parse(queuedStr);
+      setSaveStatus('syncing');
+
+      // If more than 4 distinct offline edit cycles were performed, create a recovery version snapshot
+      const shouldSnapshot = (queued.offlineEditsCount || 0) >= 4;
+
+      const res = await fetch(`/api/documents/${initialDocument.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: queued.title,
+          content: queued.content,
+          createSnapshot: shouldSnapshot
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        localStorage.removeItem(queuedKey);
+        offlineEditsCountRef.current = 0;
+        setSaveStatus('saved');
+        setLastSavedAt(new Date());
+
+        showToast(
+          shouldSnapshot
+            ? 'Back online: Offline changes synced & recovery version snapshot created.'
+            : 'Back online: Offline changes successfully synchronized with cloud.',
+          'success'
+        );
+
+        if (data.document?.updated_at) {
+          setDoc(prev => ({
+            ...prev,
+            title: queued.title || prev.title,
+            content: queued.content || prev.content,
+            updated_at: data.document.updated_at
+          }));
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to flush offline queue:', err);
+    }
+  }, [initialDocument.id, showToast]);
+
+  // Online / Offline window listeners
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      showToast('Internet connection restored. Synchronizing...', 'info');
+      flushPendingOfflineChanges();
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+      setSaveStatus('offline');
+      showToast('You are offline. Changes are saved locally to IndexedDB & browser storage.', 'warning');
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    // Initial check for pending queue on load
+    if (navigator.onLine) {
+      flushPendingOfflineChanges();
+    }
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [flushPendingOfflineChanges, showToast]);
+
+  // Initialize Yjs WebSocket Provider & IndexedDB Persistence
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -103,6 +212,18 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
     const wsHost = window.location.hostname || 'localhost';
     const wsUrl = `ws://${wsHost}:1234`;
 
+    // 1. IndexedDB provider for persistent local storage & offline recovery
+    let idbPersistence: IndexeddbPersistence | null = null;
+    try {
+      idbPersistence = new IndexeddbPersistence(`ajaia-doc-${initialDocument.id}`, ydoc);
+      idbPersistence.on('synced', () => {
+        setIsIdbSynced(true);
+      });
+    } catch (e) {
+      console.warn('IndexedDB persistence init warning:', e);
+    }
+
+    // 2. WebSocket provider for real-time multiplayer collaboration
     const wsProvider = new WebsocketProvider(
       wsUrl,
       docChannelName,
@@ -165,6 +286,13 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
     return () => {
       if (bc) {
         bc.close();
+      }
+      try {
+        if (idbPersistence) {
+          idbPersistence.destroy();
+        }
+      } catch (err) {
+        console.error('Error cleaning up IndexeddbPersistence:', err);
       }
       try {
         if (wsProvider.awareness) {
@@ -353,9 +481,29 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
     }
   }, [editor, canEdit]);
 
-  // Save content to SQLite backend
+  // Save content to SQLite backend (with offline queue support)
   const saveDocumentContent = async (htmlContent: string, createSnapshot: boolean = false) => {
     if (!canEdit) return;
+
+    // If browser is offline, store in offline queue and mark status as offline
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      offlineEditsCountRef.current += 1;
+      const queuedKey = `ajaia_offline_queue_${doc.id}`;
+      localStorage.setItem(
+        queuedKey,
+        JSON.stringify({
+          title,
+          content: htmlContent,
+          offlineEditsCount: offlineEditsCountRef.current,
+          timestamp: Date.now()
+        })
+      );
+      setDoc(prev => ({ ...prev, content: htmlContent }));
+      setSaveStatus('offline');
+      setLastSavedAt(new Date());
+      return;
+    }
+
     setSaveStatus('saving');
 
     try {
@@ -385,6 +533,10 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
         throw new Error(data.error || 'Failed to save document');
       }
 
+      // Clear any pending queue on successful cloud save
+      localStorage.removeItem(`ajaia_offline_queue_${doc.id}`);
+      offlineEditsCountRef.current = 0;
+
       setDoc(prev => ({
         ...prev,
         content: htmlContent,
@@ -393,12 +545,24 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
       setSaveStatus('saved');
       setLastSavedAt(new Date());
     } catch (err) {
-      console.error('Save failed:', err);
-      setSaveStatus('unsaved');
+      console.warn('Save failed or network unreachable, queueing offline:', err);
+      offlineEditsCountRef.current += 1;
+      localStorage.setItem(
+        `ajaia_offline_queue_${doc.id}`,
+        JSON.stringify({
+          title,
+          content: htmlContent,
+          offlineEditsCount: offlineEditsCountRef.current,
+          timestamp: Date.now()
+        })
+      );
+      setDoc(prev => ({ ...prev, content: htmlContent }));
+      setSaveStatus('offline');
+      setLastSavedAt(new Date());
     }
   };
 
-  // Save title changes
+  // Save title changes (with offline queue support)
   const handleTitleChange = (newTitle: string) => {
     setTitle(newTitle);
     if (!canEdit) return;
@@ -409,6 +573,24 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
     }
 
     saveTimeoutRef.current = setTimeout(async () => {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        offlineEditsCountRef.current += 1;
+        const currentHtml = editor ? editor.getHTML() : doc.content;
+        localStorage.setItem(
+          `ajaia_offline_queue_${doc.id}`,
+          JSON.stringify({
+            title: newTitle,
+            content: currentHtml,
+            offlineEditsCount: offlineEditsCountRef.current,
+            timestamp: Date.now()
+          })
+        );
+        setDoc(prev => ({ ...prev, title: newTitle }));
+        setSaveStatus('offline');
+        setLastSavedAt(new Date());
+        return;
+      }
+
       setSaveStatus('saving');
       try {
         const res = await fetch(`/api/documents/${doc.id}`, {
@@ -437,8 +619,21 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
           setLastSavedAt(new Date());
         }
       } catch (err) {
-        console.error('Title save failed:', err);
-        setSaveStatus('unsaved');
+        console.warn('Title save failed or network unreachable, queueing offline:', err);
+        offlineEditsCountRef.current += 1;
+        const currentHtml = editor ? editor.getHTML() : doc.content;
+        localStorage.setItem(
+          `ajaia_offline_queue_${doc.id}`,
+          JSON.stringify({
+            title: newTitle,
+            content: currentHtml,
+            offlineEditsCount: offlineEditsCountRef.current,
+            timestamp: Date.now()
+          })
+        );
+        setDoc(prev => ({ ...prev, title: newTitle }));
+        setSaveStatus('offline');
+        setLastSavedAt(new Date());
       }
     }, 800);
   };
@@ -593,22 +788,32 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
             </div>
           </div>
 
-          {/* Save status */}
-          <div className="text-[11px] text-slate-500 hidden md:flex items-center gap-1 px-2 py-1 bg-slate-50 rounded-lg border border-slate-200/60">
+          {/* Save status badge */}
+          <div className="text-[11px] text-slate-500 hidden md:flex items-center gap-1.5 px-2.5 py-1 bg-slate-50 rounded-lg border border-slate-200/80">
             {saveStatus === 'saving' ? (
               <>
-                <Loader2 className="w-3 h-3 animate-spin text-blue-500" />
-                <span>Saving...</span>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />
+                <span className="text-slate-600 font-medium">Saving...</span>
+              </>
+            ) : saveStatus === 'syncing' ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-500" />
+                <span className="text-indigo-600 font-medium">Syncing offline edits...</span>
+              </>
+            ) : saveStatus === 'offline' ? (
+              <>
+                <HardDrive className="w-3.5 h-3.5 text-amber-600" />
+                <span className="text-amber-700 font-medium">Saved locally (Offline)</span>
               </>
             ) : saveStatus === 'unsaved' ? (
               <>
-                <CloudOff className="w-3 h-3 text-amber-500" />
-                <span>Unsaved</span>
+                <CloudOff className="w-3.5 h-3.5 text-amber-500" />
+                <span className="text-slate-600">Unsaved</span>
               </>
             ) : (
               <>
-                <Cloud className="w-3 h-3 text-emerald-600" />
-                <span>Saved</span>
+                <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="text-slate-600 font-medium">Saved</span>
               </>
             )}
           </div>
@@ -791,6 +996,42 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({
         currentDocumentId={doc.id}
         onInsertContent={handleInsertHtml}
       />
+
+      {/* Floating Network & Sync Toast Notification */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-50 animate-in fade-in slide-in-from-bottom-3 duration-200 max-w-sm">
+          <div
+            className={`px-4 py-3 rounded-2xl shadow-xl border flex items-start gap-3 text-xs backdrop-blur-md transition-all ${
+              toast.type === 'success'
+                ? 'bg-emerald-50/95 border-emerald-200 text-emerald-900 shadow-emerald-500/10'
+                : toast.type === 'warning'
+                ? 'bg-amber-50/95 border-amber-200 text-amber-900 shadow-amber-500/10'
+                : toast.type === 'error'
+                ? 'bg-rose-50/95 border-rose-200 text-rose-900 shadow-rose-500/10'
+                : 'bg-slate-900/95 border-slate-800 text-white shadow-slate-900/20'
+            }`}
+          >
+            <div className="shrink-0 mt-0.5">
+              {toast.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              ) : toast.type === 'warning' ? (
+                <WifiOff className="w-4 h-4 text-amber-600" />
+              ) : toast.type === 'error' ? (
+                <AlertCircle className="w-4 h-4 text-rose-600" />
+              ) : (
+                <Wifi className="w-4 h-4 text-blue-400" />
+              )}
+            </div>
+            <div className="flex-1 font-medium leading-relaxed">{toast.message}</div>
+            <button
+              onClick={() => setToast(null)}
+              className="text-slate-400 hover:text-slate-600 p-0.5 rounded cursor-pointer shrink-0 transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
